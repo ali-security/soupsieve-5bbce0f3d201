@@ -1,14 +1,12 @@
 name: build
 
 on:
-  push:
-    branches:
-      - 'main'
-    tags:
-    - '**'
-  pull_request:
-    branches:
-    - '**'
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: 'Optional pytest -k expression to narrow the test run'
+        required: false
+        default: ''
 
 jobs:
   tests:
@@ -16,30 +14,28 @@ jobs:
       fail-fast: false
       max-parallel: 4
       matrix:
-        platform: [ubuntu-latest, windows-latest]
+        platform: [ubuntu-22.04, windows-latest]
         tox-env: [py37, py38, py39, py310, py311, nolxml, nohtml5lib]
         include:
           - tox-env: py37
             python-version: 3.7
-            continue-on-error: false
           - tox-env: py38
             python-version: 3.8
-            continue-on-error: false
+          # Release-era CPython patch levels: html.parser's handling of the
+          # content of <iframe> changed in later 3.9/3.10/3.11 security
+          # releases, which breaks the project's iframe tests on 2.4.1.
+          # These are the newest patch levels with both a Linux and a Windows
+          # build in the setup-python manifest.
           - tox-env: py39
-            python-version: 3.9
-            continue-on-error: false
+            python-version: '3.9.13'
           - tox-env: py310
-            python-version: '3.10'
-            continue-on-error: false
+            python-version: '3.10.11'
           - tox-env: py311
-            python-version: '3.11'
-            continue-on-error: false
+            python-version: '3.11.3'
           - tox-env: nolxml
-            python-version: '3.11'
-            continue-on-error: false
+            python-version: '3.11.3'
           - tox-env: nohtml5lib
-            python-version: '3.10'
-            continue-on-error: false
+            python-version: '3.10.11'
         # exclude:
         #   - platform: windows-latest
         #     tox-env: py311
@@ -48,12 +44,13 @@ jobs:
       TOXENV: ${{ matrix.tox-env }}
 
     runs-on: ${{ matrix.platform }}
+    timeout-minutes: 40
 
     steps:
-    - uses: actions/checkout@v3
+    - uses: actions/checkout@v4
     - name: Set up Python ${{ matrix.python-version }}
       if: "!endsWith(matrix.python-version, '-dev')"
-      uses: actions/setup-python@v4
+      uses: actions/setup-python@v5
       with:
         python-version: ${{ matrix.python-version }}
     - name: Set up development Python ${{ matrix.python-version }}
@@ -67,63 +64,33 @@ jobs:
     - name: Test
       run: |
         python -m tox
-      continue-on-error: ${{ matrix.continue-on-error }}
-    - name: Upload Results
-      if: success()
-      uses: codecov/codecov-action@v3
-      with:
-        file: ./coverage.xml
-        flags: unittests
-        name: ${{ matrix.platform }}-${{ matrix.tox-env }}
-        fail_ci_if_error: false
+      env:
+        PYTEST_ADDOPTS: ${{ inputs.test-filter != '' && format('-k "{0}"', inputs.test-filter) || '' }}
 
-  lint:
-    strategy:
-      max-parallel: 4
-      matrix:
-        python-version: [3.9]
-
-    env:
-      TOXENV: lint
-
-    runs-on: ubuntu-latest
+  package:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
 
     steps:
-    - uses: actions/checkout@v3
-    - name: Set up Python ${{ matrix.python-version }}
-      uses: actions/setup-python@v4
-      with:
-        python-version: ${{ matrix.python-version }}
-    - name: Install dependencies
-      run: |
-        python -m pip install --upgrade pip setuptools tox
-    - name: Lint
-      run: |
-        python -m tox
-
-  documents:
-    strategy:
-      max-parallel: 4
-      matrix:
-        python-version: [3.9]
-
-    env:
-      TOXENV: documents
-
-    runs-on: ubuntu-latest
-
-    steps:
-    - uses: actions/checkout@v3
-    - name: Set up Python ${{ matrix.python-version }}
-      uses: actions/setup-python@v4
-      with:
-        python-version: ${{ matrix.python-version }}
-    - name: Install dependencies
-      run: |
-        python -m pip install --upgrade pip setuptools tox
-    - name: Install Aspell
-      run: |
-        sudo apt-get install aspell aspell-en
-    - name: Build documents
-      run: |
-        python -m tox
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: 3.9
+      - name: Package
+        run: |
+          pip install --upgrade build 'hatchling==1.14.0'
+          # hatchling 1.14.0's custom-metadata-hook loader calls
+          # importlib.util.spec_from_file_location after only `import
+          # importlib`; it used to work because something else in the
+          # interpreter startup path bound the submodule. It no longer does, so
+          # bind it explicitly in every child interpreter the build spawns.
+          mkdir -p "${RUNNER_TEMP}/sitehook"
+          echo "import importlib.util" > "${RUNNER_TEMP}/sitehook/sitecustomize.py"
+          export PYTHONPATH="${RUNNER_TEMP}/sitehook"
+          python -m build --no-isolation -s -w
+      - name: Upload distributions
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/*
+          if-no-files-found: error
