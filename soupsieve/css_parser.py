@@ -11,6 +11,11 @@ from typing import Match, Any, Iterator, cast
 
 UNICODE_REPLACEMENT_CHAR = 0xFFFD
 
+# Maximum number of selectors a single pattern is allowed to expand to.
+# Selector lists, forgiving empty slots, custom selectors, and the precompiled
+# selector lists that back complex pseudo-classes all count against this budget.
+SELECTOR_LIMIT = 8192
+
 # Simple pseudo classes that take no parameters
 PSEUDO_SIMPLE = {
     ":any-link",
@@ -473,6 +478,17 @@ class CSSParser:
         self.flags = flags
         self.debug = self.flags & util.DEBUG
         self.custom = {} if custom is None else custom
+        self.count = 0
+
+    def check_count(self) -> None:
+        """Check the current selector count."""
+
+        if self.count > SELECTOR_LIMIT:
+            # Do not feed the pattern to `SelectorSyntaxError` as the offending
+            # patterns are large and rendering their context is expensive.
+            raise SelectorSyntaxError(
+                'Selector exceeds pseudo-class nesting limit of {}'.format(SELECTOR_LIMIT)
+            )
 
     def parse_attribute_selector(self, sel: _Selector, m: Match[str], has_selector: bool) -> bool:
         """Create attribute selector from the returned regex match."""
@@ -577,6 +593,9 @@ class CSSParser:
             ).process_selectors(flags=FLG_PSEUDO)
             self.custom[pseudo] = selector
 
+        self.count += selector.count
+        self.check_count()
+
         sel.selectors.append(selector)
         has_selector = True
         return has_selector
@@ -608,30 +627,56 @@ class CSSParser:
             elif pseudo == ':empty':
                 sel.flags |= ct.SEL_EMPTY
             elif pseudo in (':link', ':any-link'):
+                self.count += CSS_LINK.count
+                self.check_count()
                 sel.selectors.append(CSS_LINK)
             elif pseudo == ':checked':
+                self.count += CSS_CHECKED.count
+                self.check_count()
                 sel.selectors.append(CSS_CHECKED)
             elif pseudo == ':default':
+                self.count += CSS_DEFAULT.count
+                self.check_count()
                 sel.selectors.append(CSS_DEFAULT)
             elif pseudo == ':indeterminate':
+                self.count += CSS_INDETERMINATE.count
+                self.check_count()
                 sel.selectors.append(CSS_INDETERMINATE)
             elif pseudo == ":disabled":
+                self.count += CSS_DISABLED.count
+                self.check_count()
                 sel.selectors.append(CSS_DISABLED)
             elif pseudo == ":enabled":
+                self.count += CSS_ENABLED.count
+                self.check_count()
                 sel.selectors.append(CSS_ENABLED)
             elif pseudo == ":required":
+                self.count += CSS_REQUIRED.count
+                self.check_count()
                 sel.selectors.append(CSS_REQUIRED)
             elif pseudo == ":optional":
+                self.count += CSS_OPTIONAL.count
+                self.check_count()
                 sel.selectors.append(CSS_OPTIONAL)
             elif pseudo == ":read-only":
+                self.count += CSS_READ_ONLY.count
+                self.check_count()
                 sel.selectors.append(CSS_READ_ONLY)
             elif pseudo == ":read-write":
+                self.count += CSS_READ_WRITE.count
+                self.check_count()
                 sel.selectors.append(CSS_READ_WRITE)
             elif pseudo == ":in-range":
+                self.count += CSS_IN_RANGE.count
+                self.check_count()
                 sel.selectors.append(CSS_IN_RANGE)
             elif pseudo == ":out-of-range":
+                self.count += CSS_OUT_OF_RANGE.count
+                self.check_count()
                 sel.selectors.append(CSS_OUT_OF_RANGE)
             elif pseudo == ":placeholder-shown":
+                self.count += CSS_PLACEHOLDER_SHOWN.count
+                self.check_count()
                 sel.selectors.append(CSS_PLACEHOLDER_SHOWN)
             elif pseudo == ':first-child':
                 sel.nth.append(ct.SelectorNth(1, False, 0, False, False, ct.SelectorList()))
@@ -729,6 +774,8 @@ class CSSParser:
             else:
                 # Use default `*|*` for `of S`.
                 nth_sel = CSS_NTH_OF_S_DEFAULT
+                self.count += nth_sel.count
+                self.check_count()
             if pseudo_sel == ':nth-child':
                 sel.nth.append(ct.SelectorNth(s1, var, s2, False, False, nth_sel))
             elif pseudo_sel == ':nth-last-child':
@@ -779,6 +826,12 @@ class CSSParser:
         if not combinator:
             combinator = WS_COMBINATOR
         if combinator == COMMA_COMBINATOR:
+            if not has_selector:
+                raise SelectorSyntaxError(
+                    "The combinator '{}' at position {}, must have a selector before it".format(combinator, index),
+                    self.pattern,
+                    index
+                )
             sel.rel_type = rel_type
             selectors[-1].relations.append(sel)
             rel_type = ":" + WS_COMBINATOR
@@ -831,11 +884,12 @@ class CSSParser:
                     index
                 )
 
-            # If we are in a forgiving pseudo class, just make the selector a "no match"
+            # If we are in a forgiving pseudo class, the empty slot is simply dropped,
+            # but it still counts against the selector budget.
             if combinator == COMMA_COMBINATOR:
-                sel.no_match = True
+                self.count += 1
+                self.check_count()
                 del relations[:]
-                selectors.append(sel)
         else:
             if combinator == COMMA_COMBINATOR:
                 if not sel.tag and not is_pseudo:
@@ -935,6 +989,7 @@ class CSSParser:
         closed = False
         relations = []  # type: list[_Selector]
         rel_type = ":" + WS_COMBINATOR
+        count = self.count
 
         # Setup various flags
         is_open = bool(flags & FLG_OPEN)
@@ -981,6 +1036,10 @@ class CSSParser:
         try:
             while True:
                 key, m = next(iselector)
+
+                if key not in ('combine', 'pseudo_close'):
+                    self.count += 1
+                    self.check_count()
 
                 # Handle parts
                 if key == "at_rule":
@@ -1069,6 +1128,8 @@ class CSSParser:
         # Forgive empty slots in pseudo-classes that have lists (and are forgiving)
         elif is_forgive and (not selectors or not relations):
             # Handle normal pseudo-classes with empty slots like `:is()` etc.
+            self.count += 1
+            self.check_count()
             sel.no_match = True
             del relations[:]
             selectors.append(sel)
@@ -1098,7 +1159,7 @@ class CSSParser:
             selectors[-1].flags = ct.SEL_PLACEHOLDER_SHOWN
 
         # Return selector list
-        return ct.SelectorList([s.freeze() for s in selectors], is_not, is_html)
+        return ct.SelectorList([s.freeze() for s in selectors], is_not, is_html, self.count - count)
 
     def selector_iter(self, pattern: str) -> Iterator[tuple[str, Match[str]]]:
         """Iterate selector tokens."""
